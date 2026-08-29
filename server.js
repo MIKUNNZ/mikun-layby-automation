@@ -14,7 +14,13 @@ import Stripe from "stripe";
 
 const {
   SHOPIFY_STORE_DOMAIN, // e.g. mikun-3.myshopify.com
-  SHOPIFY_ADMIN_API_ACCESS_TOKEN,
+  // Shopify retired static Admin API tokens for new custom apps as of Jan 1,
+  // 2026. Apps now authenticate with the client credentials grant: exchange
+  // these two values for a short-lived (24hr) token, per request, instead of
+  // using one long-lived token forever. Both come from Dev Dashboard → your
+  // app → Settings → Credentials.
+  SHOPIFY_CLIENT_ID,
+  SHOPIFY_CLIENT_SECRET,
   SHOPIFY_WEBHOOK_SECRET,
   SHOPIFY_API_VERSION = "2024-10",
   DROPBOX_SIGN_API_KEY,
@@ -41,7 +47,8 @@ const {
 // without a redeploy from scratch.
 const REQUIRED_TO_BOOT = {
   SHOPIFY_STORE_DOMAIN,
-  SHOPIFY_ADMIN_API_ACCESS_TOKEN,
+  SHOPIFY_CLIENT_ID,
+  SHOPIFY_CLIENT_SECRET,
   STRIPE_RESTRICTED_KEY,
 };
 for (const [key, value] of Object.entries(REQUIRED_TO_BOOT)) {
@@ -93,12 +100,42 @@ function verifyWebhook(req) {
   }
 }
 
+// Client credentials grant: exchange CLIENT_ID + CLIENT_SECRET for a token
+// good for 24 hours. Cached in memory and refreshed a minute before expiry,
+// so normal traffic reuses one token instead of requesting a fresh one on
+// every call — Shopify's own reference implementation for this flow does
+// the same thing.
+let _shopifyToken = null;
+let _shopifyTokenExpiresAt = 0;
+
+async function getShopifyAccessToken() {
+  if (_shopifyToken && Date.now() < _shopifyTokenExpiresAt - 60_000) {
+    return _shopifyToken;
+  }
+  const res = await fetch(`https://${SHOPIFY_STORE_DOMAIN}/admin/oauth/access_token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "client_credentials",
+      client_id: SHOPIFY_CLIENT_ID,
+      client_secret: SHOPIFY_CLIENT_SECRET,
+    }),
+  });
+  if (!res.ok) {
+    throw new Error(`Shopify token exchange failed: ${res.status} ${await res.text()}`);
+  }
+  const { access_token, expires_in } = await res.json();
+  _shopifyToken = access_token;
+  _shopifyTokenExpiresAt = Date.now() + expires_in * 1000;
+  return _shopifyToken;
+}
+
 async function adminGraphQL(query, variables = {}) {
   const res = await fetch(`https://${SHOPIFY_STORE_DOMAIN}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "X-Shopify-Access-Token": SHOPIFY_ADMIN_API_ACCESS_TOKEN,
+      "X-Shopify-Access-Token": await getShopifyAccessToken(),
     },
     body: JSON.stringify({ query, variables }),
   });
