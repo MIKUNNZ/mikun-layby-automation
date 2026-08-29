@@ -1,0 +1,16 @@
+{
+  "name": "layby-agreement-automation",
+  "version": "1.0.0",
+  "description": "Auto-drafts and sends the MIKUN layby agreement for e-signature when a layby deposit is purchased.",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "register-webhook": "node register-webhook.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "node-fetch": "^3.3.2",
+    "stripe": "^17.4.0"
+  }
+}
