@@ -75,6 +75,29 @@ const stripe = new Stripe(STRIPE_RESTRICTED_KEY);
 
 const app = express();
 
+// The layby modal's JS runs on mikun.com and calls this server on a
+// different origin (onrender.com) — without explicit CORS headers, browsers
+// silently block the response ("Failed to fetch"), even though the request
+// itself reaches the server fine. Scoped to the storefront's actual domains
+// rather than a wildcard, since this handles customer payment intent.
+const ALLOWED_ORIGINS = new Set([
+  "https://mikun.com",
+  "https://www.mikun.com",
+  `https://${SHOPIFY_STORE_DOMAIN}`,
+]);
+app.use((req, res, next) => {
+  const origin = req.get("Origin");
+  if (origin && ALLOWED_ORIGINS.has(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  }
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(204);
+  }
+  next();
+});
+
 // Stripe's webhook signature check needs the raw, untouched request body —
 // it must be registered BEFORE express.json() parses the body into an
 // object, or verification will always fail. Every other route uses the
