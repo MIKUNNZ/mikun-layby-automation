@@ -23,9 +23,8 @@ const {
   SHOPIFY_CLIENT_SECRET,
   SHOPIFY_WEBHOOK_SECRET,
   SHOPIFY_API_VERSION = "2024-10",
-  DROPBOX_SIGN_API_KEY,
-  DROPBOX_SIGN_TEMPLATE_ID,
-  DROPBOX_SIGN_TEST_MODE = "true", // "true" while testing; switch to "false" to send real signature requests
+  DOCUSEAL_API_KEY,
+  DOCUSEAL_TEMPLATE_ID,
   LAYBY_TERM_WEEKS = "16",
   LAYBY_DEPOSIT_SKU_PREFIX = "LAYBY-DEP-",
   // Stripe — the restricted key you created scoped to Checkout Sessions,
@@ -57,9 +56,9 @@ for (const [key, value] of Object.entries(REQUIRED_TO_BOOT)) {
     process.exit(1);
   }
 }
-if (!DROPBOX_SIGN_API_KEY || !DROPBOX_SIGN_TEMPLATE_ID) {
+if (!DOCUSEAL_API_KEY || !DOCUSEAL_TEMPLATE_ID) {
   console.warn(
-    "DROPBOX_SIGN_API_KEY / DROPBOX_SIGN_TEMPLATE_ID not set — deposit payments will be accepted and items reserved, but the layby agreement won't be sent until these are added."
+    "DOCUSEAL_API_KEY / DOCUSEAL_TEMPLATE_ID not set — deposit payments will be accepted and items reserved, but the layby agreement won't be sent until these are added."
   );
 }
 if (!STRIPE_WEBHOOK_SECRET) {
@@ -315,50 +314,56 @@ function money(amount, currency) {
   return new Intl.NumberFormat("en-NZ", { style: "currency", currency }).format(amount);
 }
 
-async function sendForSignature({ customerName, customerEmail, itemTitle, orderReference, totalPrice, depositAmount, currency, agreementDate, dueDate }) {
+async function sendForSignature({ customerName, customerEmail, customerPhone, itemTitle, orderReference, totalPrice, depositAmount, currency, agreementDate, dueDate }) {
   const balance = totalPrice - depositAmount;
 
-  const body = new URLSearchParams();
-  body.append("template_ids[0]", DROPBOX_SIGN_TEMPLATE_ID);
-  body.append("subject", `Your MIKUN layby agreement — ${itemTitle}`);
-  body.append("message", "Please review and sign your layby agreement below. Once signed, we'll hold your item and be in touch about your payment plan.");
-  body.append("test_mode", DROPBOX_SIGN_TEST_MODE === "true" ? "1" : "0");
-
-  // Signer role name here MUST exactly match the role name set on the
-  // template in the Dropbox Sign dashboard (e.g. "Customer").
-  body.append("signers[Customer][name]", customerName);
-  body.append("signers[Customer][email_address]", customerEmail);
-
-  // Field names here MUST exactly match the merge field names placed on the
-  // template in the Dropbox Sign editor.
-  const fields = {
-    customer_name: customerName,
-    item_description: itemTitle,
-    order_reference: orderReference,
+  // Field names below MUST exactly match the field names set on the
+  // DocuSeal template (Templates → MIKUN Layby Sale Agreement → each
+  // field's name in the right-hand panel). Signature and date fields are
+  // deliberately left out of "values" — those are filled in by the signer
+  // at signing time, not prefilled by the server.
+  const values = {
     agreement_date: formatDate(agreementDate),
+    customer_name: customerName,
+    customer_email: customerEmail,
+    customer_phone: customerPhone || "",
+    item_description: itemTitle,
+    product_reference: orderReference,
     total_price: money(totalPrice, currency),
     deposit_amount: money(depositAmount, currency),
     balance_amount: money(balance, currency),
-    due_date: formatDate(dueDate),
+    balance_due_date: formatDate(dueDate),
   };
-  Object.entries(fields).forEach(([name, value], i) => {
-    body.append(`custom_fields[${i}][name]`, name);
-    body.append(`custom_fields[${i}][value]`, value);
-  });
 
-  const res = await fetch("https://api.hellosign.com/v3/signature_request/send_with_template", {
+  const res = await fetch("https://api.docuseal.com/submissions", {
     method: "POST",
     headers: {
-      Authorization: "Basic " + Buffer.from(`${DROPBOX_SIGN_API_KEY}:`).toString("base64"),
-      "Content-Type": "application/x-www-form-urlencoded",
+      "X-Auth-Token": DOCUSEAL_API_KEY,
+      "Content-Type": "application/json",
     },
-    body,
+    body: JSON.stringify({
+      template_id: Number(DOCUSEAL_TEMPLATE_ID),
+      send_email: true,
+      order: "preserved",
+      message: {
+        subject: `Your MIKUN layby agreement — ${itemTitle}`,
+        body: "Please review and sign your layby agreement below. Once signed, we'll hold your item and be in touch about your payment plan.",
+      },
+      submitters: [
+        {
+          role: "First Party",
+          name: customerName,
+          email: customerEmail,
+          values,
+        },
+      ],
+    }),
   });
   const json = await res.json();
   if (!res.ok) {
-    throw new Error(`Dropbox Sign error: ${JSON.stringify(json)}`);
+    throw new Error(`DocuSeal error: ${JSON.stringify(json)}`);
   }
-  return json.signature_request;
+  return json;
 }
 
 app.post("/webhooks/orders/create", async (req, res) => {
@@ -412,7 +417,8 @@ app.post("/webhooks/orders/create", async (req, res) => {
       dueDate,
     });
 
-    console.log(`Order ${order.name}: layby agreement sent for signature (request id ${result.signature_request_id}).`);
+    const submissionId = Array.isArray(result) ? result[0]?.submission_id ?? result[0]?.id : result?.id;
+    console.log(`Order ${order.name}: layby agreement sent for signature (submission id ${submissionId}).`);
   } catch (err) {
     console.error("Error processing order webhook:", err);
   }
@@ -538,6 +544,7 @@ async function handleStripeWebhook(req, res) {
       full_price: fullPriceStr,
       deposit_amount: depositAmountStr,
       customer_name: customerName,
+      customer_phone: customerPhone,
     } = session.metadata;
 
     const fullPrice = parseFloat(fullPriceStr);
@@ -550,9 +557,9 @@ async function handleStripeWebhook(req, res) {
     // the instant payment clears, regardless of what happens next.
     await reserveTargetProduct(productGid);
 
-    if (!DROPBOX_SIGN_API_KEY || !DROPBOX_SIGN_TEMPLATE_ID) {
+    if (!DOCUSEAL_API_KEY || !DOCUSEAL_TEMPLATE_ID) {
       console.warn(
-        `Stripe checkout ${session.id}: deposit paid, ${itemTitle} reserved. Dropbox Sign not configured — agreement NOT sent. Send it manually, then add the Dropbox Sign env vars to automate this step too.`
+        `Stripe checkout ${session.id}: deposit paid, ${itemTitle} reserved. DocuSeal not configured — agreement NOT sent. Send it manually, then add the DocuSeal env vars to automate this step too.`
       );
       return;
     }
@@ -564,6 +571,7 @@ async function handleStripeWebhook(req, res) {
     const result = await sendForSignature({
       customerName: customerName || "Customer",
       customerEmail,
+      customerPhone,
       itemTitle,
       orderReference,
       totalPrice: fullPrice,
@@ -573,8 +581,11 @@ async function handleStripeWebhook(req, res) {
       dueDate,
     });
 
+    // DocuSeal's response is an array, one entry per submitter — we only
+    // ever send one (the customer), so [0] is the submission we just made.
+    const submissionId = Array.isArray(result) ? result[0]?.submission_id ?? result[0]?.id : result?.id;
     console.log(
-      `Stripe checkout ${session.id}: deposit paid, ${itemTitle} reserved, agreement sent (request id ${result.signature_request_id}).`
+      `Stripe checkout ${session.id}: deposit paid, ${itemTitle} reserved, agreement sent (submission id ${submissionId}).`
     );
   } catch (err) {
     console.error("Error processing Stripe checkout.session.completed:", err);
