@@ -23,8 +23,8 @@ const {
   SHOPIFY_CLIENT_SECRET,
   SHOPIFY_WEBHOOK_SECRET,
   SHOPIFY_API_VERSION = "2024-10",
-  DOCUSEAL_API_KEY,
-  DOCUSEAL_TEMPLATE_ID,
+  LAYBY_AGREEMENT_API_BASE = "https://project--78e6e767-1c5d-4be3-8ff7-fbb4cce5ae30-dev.lovable.app",
+  LAYBY_AGREEMENT_PAGE_URL = "https://mikun.com/pages/layby-agreement",
   LAYBY_TERM_WEEKS = "16",
   LAYBY_DEPOSIT_SKU_PREFIX = "LAYBY-DEP-",
   // Stripe — the restricted key you created scoped to Checkout Sessions,
@@ -55,11 +55,6 @@ for (const [key, value] of Object.entries(REQUIRED_TO_BOOT)) {
     console.error(`Missing required environment variable: ${key}. See .env.example.`);
     process.exit(1);
   }
-}
-if (!DOCUSEAL_API_KEY || !DOCUSEAL_TEMPLATE_ID) {
-  console.warn(
-    "DOCUSEAL_API_KEY / DOCUSEAL_TEMPLATE_ID not set — deposit payments will be accepted and items reserved, but the layby agreement won't be sent until these are added."
-  );
 }
 if (!STRIPE_WEBHOOK_SECRET) {
   console.warn(
@@ -306,64 +301,37 @@ async function getOrderDetails(orderGid) {
   return data.order;
 }
 
-function formatDate(d) {
-  return d.toLocaleDateString("en-NZ", { day: "2-digit", month: "2-digit", year: "numeric" });
-}
-
-function money(amount, currency) {
-  return new Intl.NumberFormat("en-NZ", { style: "currency", currency }).format(amount);
-}
-
-async function sendForSignature({ customerName, customerEmail, customerPhone, itemTitle, orderReference, totalPrice, depositAmount, currency, agreementDate, dueDate }) {
-  const balance = totalPrice - depositAmount;
-
-  // Field names below MUST exactly match the field names set on the
-  // DocuSeal template (Templates → MIKUN Layby Sale Agreement → each
-  // field's name in the right-hand panel). Signature and date fields are
-  // deliberately left out of "values" — those are filled in by the signer
-  // at signing time, not prefilled by the server.
-  const values = {
-    agreement_date: formatDate(agreementDate),
-    customer_name: customerName,
-    customer_email: customerEmail,
-    customer_phone: customerPhone || "",
-    item_description: itemTitle,
-    product_reference: orderReference,
-    total_price: money(totalPrice, currency),
-    deposit_amount: money(depositAmount, currency),
-    balance_amount: money(balance, currency),
-    balance_due_date: formatDate(dueDate),
-  };
-
-  const res = await fetch("https://api.docuseal.com/submissions", {
+async function createAgreementLink({ customerName, customerEmail, customerPhone, productGid, itemTitle, orderReference, totalPrice, depositAmount, currency, agreementDate, dueDate }) {
+  // Calls our own Lovable-hosted agreement app: creates a layby record and
+  // returns a private token. The customer signs on our own site (mikun.com)
+  // rather than a third-party e-signature tool — no email roundtrip needed.
+  const res = await fetch(`${LAYBY_AGREEMENT_API_BASE}/api/public/layby-intake`, {
     method: "POST",
-    headers: {
-      "X-Auth-Token": DOCUSEAL_API_KEY,
-      "Content-Type": "application/json",
-    },
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      template_id: Number(DOCUSEAL_TEMPLATE_ID),
-      send_email: true,
-      order: "preserved",
-      message: {
-        subject: `Your MIKUN layby agreement — ${itemTitle}`,
-        body: "Please review and sign your layby agreement below. Once signed, we'll hold your item and be in touch about your payment plan.",
-      },
-      submitters: [
-        {
-          role: "First Party",
-          name: customerName,
-          email: customerEmail,
-          values,
-        },
-      ],
+      productGid,
+      itemTitle,
+      itemReference: orderReference,
+      totalPrice,
+      depositAmount,
+      currency,
+      customerName,
+      customerEmail,
+      customerPhone: customerPhone || "",
+      agreementDate: agreementDate.toISOString(),
+      dueDate: dueDate.toISOString(),
+      termWeeks: parseInt(LAYBY_TERM_WEEKS, 10),
     }),
   });
   const json = await res.json();
   if (!res.ok) {
-    throw new Error(`DocuSeal error: ${JSON.stringify(json)}`);
+    throw new Error(`Layby agreement intake error: ${JSON.stringify(json)}`);
   }
-  return json;
+  // json.token is the private key; build the on-site signing URL ourselves
+  // rather than trusting any URL the intake API might return, since only
+  // mikun.com should ever be linked to a customer.
+  const signingUrl = `${LAYBY_AGREEMENT_PAGE_URL}?id=${encodeURIComponent(json.token)}`;
+  return { token: json.token, reference: json.reference, signingUrl };
 }
 
 app.post("/webhooks/orders/create", async (req, res) => {
@@ -405,9 +373,10 @@ app.post("/webhooks/orders/create", async (req, res) => {
 
     const customerName = [order.customer.firstName, order.customer.lastName].filter(Boolean).join(" ") || "Customer";
 
-    const result = await sendForSignature({
+    const agreement = await createAgreementLink({
       customerName,
       customerEmail: order.customer.email,
+      productGid: target.id,
       itemTitle: target.title,
       orderReference: order.name,
       totalPrice: target.price,
@@ -417,8 +386,7 @@ app.post("/webhooks/orders/create", async (req, res) => {
       dueDate,
     });
 
-    const submissionId = Array.isArray(result) ? result[0]?.submission_id ?? result[0]?.id : result?.id;
-    console.log(`Order ${order.name}: layby agreement sent for signature (submission id ${submissionId}).`);
+    console.log(`Order ${order.name}: layby agreement created (reference ${agreement.reference}) — ${agreement.signingUrl}`);
   } catch (err) {
     console.error("Error processing order webhook:", err);
   }
@@ -475,6 +443,35 @@ app.post("/api/create-layby-checkout", async (req, res) => {
     const depositAmount = Math.round(product.price * 0.2 * 100) / 100; // 20%, rounded to cents
     const currency = product.currency.toLowerCase();
 
+    const agreementDate = new Date();
+    const dueDate = new Date(agreementDate);
+    dueDate.setDate(dueDate.getDate() + parseInt(LAYBY_TERM_WEEKS, 10) * 7);
+
+    // Created before checkout, not after, so the moment the deposit clears
+    // Stripe can send the customer straight to their own agreement page —
+    // no separate email round trip needed. The item itself is only ever
+    // reserved later, from the payment webhook below, once money has
+    // actually moved — never from this step.
+    let agreement;
+    try {
+      agreement = await createAgreementLink({
+        customerName,
+        customerEmail,
+        customerPhone,
+        productGid,
+        itemTitle: product.title,
+        orderReference: product.reference,
+        totalPrice: product.price,
+        depositAmount,
+        currency: currency.toUpperCase(),
+        agreementDate,
+        dueDate,
+      });
+    } catch (agreementErr) {
+      console.error("Could not create layby agreement record — falling back to enquiry flow:", agreementErr);
+      return res.status(502).json({ error: "Could not prepare your layby agreement. Please try again or contact us directly." });
+    }
+
     const session = await stripe.checkout.sessions.create({
       mode: "payment",
       customer_email: customerEmail,
@@ -491,7 +488,7 @@ app.post("/api/create-layby-checkout", async (req, res) => {
           quantity: 1,
         },
       ],
-      success_url: `${STOREFRONT_BASE_URL}/pages/how-layby-works?layby_paid=1`,
+      success_url: agreement.signingUrl,
       cancel_url: `${STOREFRONT_BASE_URL}/products/${product.handle || ""}`,
       metadata: {
         mikun_flow: "layby_deposit",
@@ -503,6 +500,8 @@ app.post("/api/create-layby-checkout", async (req, res) => {
         customer_name: customerName,
         customer_phone: customerPhone || "",
         note: (note || "").slice(0, 400),
+        layby_agreement_token: agreement.token,
+        layby_agreement_reference: agreement.reference,
       },
     });
 
@@ -540,52 +539,18 @@ async function handleStripeWebhook(req, res) {
     const {
       product_gid: productGid,
       product_title: itemTitle,
-      product_reference: orderReference,
-      full_price: fullPriceStr,
-      deposit_amount: depositAmountStr,
-      customer_name: customerName,
-      customer_phone: customerPhone,
+      layby_agreement_reference: agreementReference,
     } = session.metadata;
 
-    const fullPrice = parseFloat(fullPriceStr);
-    const depositAmount = parseFloat(depositAmountStr);
-    const currency = session.currency.toUpperCase();
-    const customerEmail = session.customer_details?.email || session.customer_email;
-
-    // Reserve the real item immediately, before sending the agreement — same
-    // reasoning as the original order-webhook flow above: protect the item
-    // the instant payment clears, regardless of what happens next.
+    // Reserve the real item now that money has actually moved. The
+    // agreement record itself was already created back when the checkout
+    // session was created (see /api/create-layby-checkout) — Stripe's
+    // success_url already sent the customer straight to it, so there's
+    // nothing left to send from here.
     await reserveTargetProduct(productGid);
 
-    if (!DOCUSEAL_API_KEY || !DOCUSEAL_TEMPLATE_ID) {
-      console.warn(
-        `Stripe checkout ${session.id}: deposit paid, ${itemTitle} reserved. DocuSeal not configured — agreement NOT sent. Send it manually, then add the DocuSeal env vars to automate this step too.`
-      );
-      return;
-    }
-
-    const agreementDate = new Date();
-    const dueDate = new Date(agreementDate);
-    dueDate.setDate(dueDate.getDate() + parseInt(LAYBY_TERM_WEEKS, 10) * 7);
-
-    const result = await sendForSignature({
-      customerName: customerName || "Customer",
-      customerEmail,
-      customerPhone,
-      itemTitle,
-      orderReference,
-      totalPrice: fullPrice,
-      depositAmount,
-      currency,
-      agreementDate,
-      dueDate,
-    });
-
-    // DocuSeal's response is an array, one entry per submitter — we only
-    // ever send one (the customer), so [0] is the submission we just made.
-    const submissionId = Array.isArray(result) ? result[0]?.submission_id ?? result[0]?.id : result?.id;
     console.log(
-      `Stripe checkout ${session.id}: deposit paid, ${itemTitle} reserved, agreement sent (submission id ${submissionId}).`
+      `Stripe checkout ${session.id}: deposit paid, ${itemTitle} reserved, agreement ${agreementReference || "(reference unknown)"} awaiting signature.`
     );
   } catch (err) {
     console.error("Error processing Stripe checkout.session.completed:", err);
