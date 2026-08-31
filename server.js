@@ -273,13 +273,13 @@ async function reserveTargetProduct(targetProductGid) {
     }
   `;
   const setMetafieldResult = await adminGraphQL(setMetafieldMutation, {
-    metafields: [{ ownerId: targetProductGid, namespace: "custom", key: "reserved", type: "single_line_text_field", value: "true" }],
+    metafields: [{ ownerId: targetProductGid, namespace: "custom", key: "reserved", type: "single_line_text_field", value: "Yes" }],
   });
   if (setMetafieldResult.metafieldsSet.userErrors.length) {
     throw new Error(`Failed to set custom.reserved: ${JSON.stringify(setMetafieldResult.metafieldsSet.userErrors)}`);
   }
 
-  console.log(`Reserved ${targetProductGid}: inventory zeroed (was ${currentQty}), custom.reserved set to "true".`);
+  console.log(`Reserved ${targetProductGid}: inventory zeroed (was ${currentQty}), custom.reserved set to "Yes".`);
 }
 
 async function getOrderDetails(orderGid) {
