@@ -581,15 +581,20 @@ async function handleStripeWebhook(req, res) {
       `Stripe checkout ${session.id}: deposit paid, ${itemTitle} reserved, agreement ${agreementReference || "(reference unknown)"} awaiting signature.`
     );
 
-    // Save the shipping address Stripe just collected onto the agreement
-    // record, so it's already there by the time the layby is eventually
-    // paid off and a real Shopify order gets created from it — see
-    // /api/create-layby-order below. Best-effort: never let a problem here
-    // undo the reservation above or bounce the webhook back to Stripe.
-    const shipping = session.shipping_details?.address;
-    if (shipping && agreementToken && LAYBY_REMINDER_INTERNAL_SECRET) {
-      try {
-        const upstream = await fetch(`${LAYBY_AGREEMENT_API_BASE}/api/public/layby-shipping-address`, {
+        // Save the shipping address Stripe just collected onto the agreement
+        // record, so it's already there by the time the layby is eventually
+        // paid off and a real Shopify order gets created from it — see
+        // /api/create-layby-order below. Best-effort: never let a problem here
+        // undo the reservation above or bounce the webhook back to Stripe.
+        //
+        // Stripe moved this from the top-level `shipping_details` field to
+        // `collected_information.shipping_details` on newer API versions —
+        // checking both keeps this working regardless of which version a
+        // given webhook destination delivers.
+        const shipping = session.collected_information?.shipping_details?.address || session.shipping_details?.address;
+        if (shipping && agreementToken && LAYBY_REMINDER_INTERNAL_SECRET) {
+                try {
+                          const upstream = await fetch(`${LAYBY_AGREEMENT_API_BASE}/api/public/layby-shipping-address`, {
           method: "POST",
           headers: { "Content-Type": "application/json", "X-Internal-Secret": LAYBY_REMINDER_INTERNAL_SECRET },
           body: JSON.stringify({
