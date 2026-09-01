@@ -43,6 +43,11 @@ const {
   // (as X-Internal-Secret) when forwarding the weekly reminder trigger.
   // Must match LAYBY_REMINDER_INTERNAL_SECRET set on that project.
   LAYBY_REMINDER_INTERNAL_SECRET,
+  // Shared secret the Lovable-hosted layby backend sends (as X-Order-Secret)
+  // when it calls back here, after the owner marks a layby paid off, to
+  // create the real Shopify sales order. Separate secret, separate
+  // direction of trust from LAYBY_REMINDER_INTERNAL_SECRET above.
+  LAYBY_ORDER_SECRET,
   PORT = 3000,
 } = process.env;
 
@@ -76,6 +81,9 @@ if (!CRON_SECRET) {
 }
 if (!LAYBY_REMINDER_INTERNAL_SECRET) {
   console.warn("LAYBY_REMINDER_INTERNAL_SECRET not set — /api/send-weekly-reminders cannot forward to the layby backend until this matches its LAYBY_REMINDER_INTERNAL_SECRET.");
+}
+if (!LAYBY_ORDER_SECRET) {
+  console.warn("LAYBY_ORDER_SECRET not set — /api/create-layby-order will reject all requests until this matches the layby backend's X-Order-Secret header.");
 }
 
 const stripe = new Stripe(STRIPE_RESTRICTED_KEY);
@@ -488,6 +496,12 @@ app.post("/api/create-layby-checkout", async (req, res) => {
     const session = await stripe.checkout.sessions.create({
       mode: "payment",
       customer_email: customerEmail,
+      // Collected now, at deposit time, so the shipping address is already
+      // on file by the time the layby is eventually paid off — the
+      // "mark paid off" link can then generate a fully shippable Shopify
+      // order without asking the owner to type anything in. Edit
+      // allowed_countries below if MIKUN starts shipping laybys overseas.
+      shipping_address_collection: { allowed_countries: ["NZ"] },
       line_items: [
         {
           price_data: {
@@ -553,6 +567,7 @@ async function handleStripeWebhook(req, res) {
       product_gid: productGid,
       product_title: itemTitle,
       layby_agreement_reference: agreementReference,
+      layby_agreement_token: agreementToken,
     } = session.metadata;
 
     // Reserve the real item now that money has actually moved. The
@@ -565,6 +580,39 @@ async function handleStripeWebhook(req, res) {
     console.log(
       `Stripe checkout ${session.id}: deposit paid, ${itemTitle} reserved, agreement ${agreementReference || "(reference unknown)"} awaiting signature.`
     );
+
+    // Save the shipping address Stripe just collected onto the agreement
+    // record, so it's already there by the time the layby is eventually
+    // paid off and a real Shopify order gets created from it — see
+    // /api/create-layby-order below. Best-effort: never let a problem here
+    // undo the reservation above or bounce the webhook back to Stripe.
+    const shipping = session.shipping_details?.address;
+    if (shipping && agreementToken && LAYBY_REMINDER_INTERNAL_SECRET) {
+      try {
+        const upstream = await fetch(`${LAYBY_AGREEMENT_API_BASE}/api/public/layby-shipping-address`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-Internal-Secret": LAYBY_REMINDER_INTERNAL_SECRET },
+          body: JSON.stringify({
+            token: agreementToken,
+            address: {
+              address1: shipping.line1 || "",
+              address2: shipping.line2 || "",
+              city: shipping.city || "",
+              province: shipping.state || "",
+              zip: shipping.postal_code || "",
+              country: shipping.country || "NZ",
+            },
+          }),
+        });
+        if (!upstream.ok) {
+          console.error(`Saving shipping address for agreement ${agreementReference} failed: ${upstream.status} ${await upstream.text()}`);
+        }
+      } catch (shippingErr) {
+        console.error(`Error saving shipping address for agreement ${agreementReference}:`, shippingErr);
+      }
+    } else if (!shipping) {
+      console.warn(`Stripe checkout ${session.id} completed with no shipping address collected — check shipping_address_collection is still enabled.`);
+    }
   } catch (err) {
     console.error("Error processing Stripe checkout.session.completed:", err);
   }
@@ -603,6 +651,156 @@ app.post("/api/send-weekly-reminders", async (req, res) => {
   } catch (err) {
     console.error("Error forwarding weekly reminder trigger:", err);
     res.status(502).json({ error: "Could not reach layby agreement backend." });
+  }
+});
+
+/**
+ * Looks up the first variant of the real item, so a genuine Shopify order
+ * line item can point at it. Layby items are one-of-a-kind (see
+ * reserveTargetProduct above), so "first variant" is always the right one.
+ */
+async function getVariantForOrder(productGid) {
+  const query = `
+    query GetVariantForOrder($id: ID!) {
+      product(id: $id) {
+        title
+        variants(first: 1) {
+          nodes { id }
+        }
+      }
+    }
+  `;
+  const data = await adminGraphQL(query, { id: productGid });
+  const variant = data.product?.variants?.nodes?.[0];
+  if (!variant) {
+    throw new Error(`Product ${productGid} has no variants — cannot create an order line item for it.`);
+  }
+  return { variantId: variant.id, title: data.product.title };
+}
+
+/**
+ * Fired by the Lovable-hosted layby backend right after the owner clicks a
+ * "mark paid off" link. Creates the real Shopify sales order for record-
+ * keeping (and, when a shipping address is supplied, for fulfillment) —
+ * this is the ONLY place a layby ever becomes a genuine Shopify order; the
+ * deposit itself only ever went through Stripe (see /api/create-layby-checkout
+ * above), so nothing else in this system has created one before now.
+ *
+ * inventoryBehaviour is BYPASS because the real item's inventory was already
+ * zeroed out at deposit time (see reserveTargetProduct) — this order must
+ * not try to decrement it again.
+ *
+ * financialStatus is PAID and a matching SALE transaction is attached
+ * because, by the time this fires, the full price has genuinely been
+ * collected already (the deposit via Stripe, the balance via bank transfer
+ * reconciled by hand) — this is a record of money already received, not a
+ * new charge.
+ */
+app.post("/api/create-layby-order", async (req, res) => {
+  if (!LAYBY_ORDER_SECRET || req.get("X-Order-Secret") !== LAYBY_ORDER_SECRET) {
+    return res.status(401).json({ error: "Invalid or missing X-Order-Secret" });
+  }
+
+  const {
+    reference, // layby reference, e.g. MK-LB-EG2YSF — recorded on the order for traceability
+    productGid,
+    customerName,
+    customerEmail,
+    customerPhone,
+    totalPrice,
+    currency,
+    shippingAddress, // optional: { address1, address2, city, provinceCode, zip, countryCode }
+  } = req.body || {};
+
+  if (!productGid || !customerEmail || !totalPrice || !currency) {
+    return res.status(400).json({ error: "productGid, customerEmail, totalPrice and currency are required." });
+  }
+
+  try {
+    const { variantId, title } = await getVariantForOrder(productGid);
+
+    const [firstName, ...rest] = (customerName || "").trim().split(/\s+/).filter(Boolean);
+    const lastName = rest.join(" ") || undefined;
+
+    const amount = String(totalPrice);
+    const currencyCode = String(currency).toUpperCase();
+
+    const orderInput = {
+      email: customerEmail,
+      phone: customerPhone || undefined,
+      lineItems: [
+        {
+          variantId,
+          quantity: 1,
+          // Locks in the exact price the customer agreed to in the layby
+          // agreement, rather than whatever the item happens to be priced
+          // at in Shopify by the time it's finally paid off.
+          priceSet: { shopMoney: { amount, currencyCode } },
+        },
+      ],
+      customer: {
+        toUpsert: {
+          email: customerEmail,
+          firstName: firstName || undefined,
+          lastName,
+          phone: customerPhone || undefined,
+        },
+      },
+      financialStatus: "PAID",
+      transactions: [
+        {
+          kind: "SALE",
+          status: "SUCCESS",
+          gateway: "Layby (deposit + balance)",
+          amountSet: { shopMoney: { amount, currencyCode } },
+        },
+      ],
+      note: `Layby ${reference || ""} — paid off in full (deposit via Stripe, balance reconciled by hand).`.trim(),
+      tags: ["layby", "layby-paid-in-full"],
+    };
+
+    if (shippingAddress && shippingAddress.address1) {
+      orderInput.shippingAddress = {
+        firstName: firstName || undefined,
+        lastName,
+        phone: customerPhone || undefined,
+        address1: shippingAddress.address1,
+        address2: shippingAddress.address2 || undefined,
+        city: shippingAddress.city || undefined,
+        provinceCode: shippingAddress.provinceCode || undefined,
+        zip: shippingAddress.zip || undefined,
+        countryCode: shippingAddress.countryCode || "NZ",
+      };
+    }
+
+    const mutation = `
+      mutation CreateLaybyOrder($order: OrderCreateOrderInput!, $options: OrderCreateOptionsInput) {
+        orderCreate(order: $order, options: $options) {
+          order { id name }
+          userErrors { field message }
+        }
+      }
+    `;
+    const data = await adminGraphQL(mutation, {
+      order: orderInput,
+      options: {
+        inventoryBehaviour: "BYPASS",
+        sendReceipt: false,
+        sendFulfillmentReceipt: false,
+      },
+    });
+
+    const { order, userErrors } = data.orderCreate;
+    if (userErrors && userErrors.length) {
+      console.error(`orderCreate failed for layby ${reference}:`, JSON.stringify(userErrors));
+      return res.status(422).json({ error: "Shopify rejected the order.", details: userErrors });
+    }
+
+    console.log(`Created Shopify order ${order.name} (${order.id}) for layby ${reference} — ${title}, ${currencyCode} ${amount}.`);
+    res.status(200).json({ orderId: order.id, orderName: order.name });
+  } catch (err) {
+    console.error(`Error creating Shopify order for layby ${reference}:`, err);
+    res.status(500).json({ error: "Could not create the Shopify order." });
   }
 });
 
