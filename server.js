@@ -589,7 +589,11 @@ app.post("/api/send-weekly-reminders", async (req, res) => {
   }
 
   try {
-    const upstream = await fetch(`${LAYBY_AGREEMENT_API_BASE}/api/internal/send-weekly-reminders`, {
+    // NOTE: this is /api/public/... not /api/internal/... — Lovable's
+    // hosting platform blocks every /api/internal/* route with a hard 403
+    // on the public domain, regardless of app-level auth. Real protection
+    // here comes entirely from the X-Internal-Secret header, not the path.
+    const upstream = await fetch(`${LAYBY_AGREEMENT_API_BASE}/api/public/send-weekly-reminders`, {
       method: "POST",
       headers: { "X-Internal-Secret": LAYBY_REMINDER_INTERNAL_SECRET },
     });
