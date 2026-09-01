@@ -36,6 +36,13 @@ const {
   STRIPE_WEBHOOK_SECRET,
   // Where the customer is sent back to after paying / cancelling.
   STOREFRONT_BASE_URL = "https://mikun.com",
+  // Shared secret the Shopify Flow "Send HTTP request" action sends as
+  // X-Cron-Secret. Must match exactly what's configured in that Flow step.
+  CRON_SECRET,
+  // Shared secret this server sends on to the Lovable-hosted layby backend
+  // (as X-Internal-Secret) when forwarding the weekly reminder trigger.
+  // Must match LAYBY_REMINDER_INTERNAL_SECRET set on that project.
+  LAYBY_REMINDER_INTERNAL_SECRET,
   PORT = 3000,
 } = process.env;
 
@@ -63,6 +70,12 @@ if (!STRIPE_WEBHOOK_SECRET) {
 }
 if (!SHOPIFY_WEBHOOK_SECRET) {
   console.warn("SHOPIFY_WEBHOOK_SECRET not set — the legacy /webhooks/orders/create path (unused by the current layby flow) will reject all events.");
+}
+if (!CRON_SECRET) {
+  console.warn("CRON_SECRET not set — /api/send-weekly-reminders will reject all requests until this matches the Shopify Flow's X-Cron-Secret header.");
+}
+if (!LAYBY_REMINDER_INTERNAL_SECRET) {
+  console.warn("LAYBY_REMINDER_INTERNAL_SECRET not set — /api/send-weekly-reminders cannot forward to the layby backend until this matches its LAYBY_REMINDER_INTERNAL_SECRET.");
 }
 
 const stripe = new Stripe(STRIPE_RESTRICTED_KEY);
@@ -556,6 +569,38 @@ async function handleStripeWebhook(req, res) {
     console.error("Error processing Stripe checkout.session.completed:", err);
   }
 }
+
+/**
+ * Fired weekly by the Shopify Flow "Scheduled time" trigger. This server
+ * has no direct database access to the layby records (those live in
+ * Supabase, behind the Lovable-hosted agreement backend) — its only job
+ * here is to check the secret the Flow sends, then forward the trigger
+ * on to that backend's own protected endpoint, which does the actual
+ * query-and-send work. Two separate secrets on purpose: a leak of the
+ * Flow-facing one doesn't expose the Lovable-facing one, or vice versa.
+ */
+app.post("/api/send-weekly-reminders", async (req, res) => {
+  if (!CRON_SECRET || req.get("X-Cron-Secret") !== CRON_SECRET) {
+    return res.status(401).json({ error: "Invalid or missing X-Cron-Secret" });
+  }
+  if (!LAYBY_REMINDER_INTERNAL_SECRET) {
+    console.error("Cannot forward weekly reminder trigger: LAYBY_REMINDER_INTERNAL_SECRET is not configured.");
+    return res.status(500).json({ error: "Server not configured to forward reminder trigger." });
+  }
+
+  try {
+    const upstream = await fetch(`${LAYBY_AGREEMENT_API_BASE}/api/internal/send-weekly-reminders`, {
+      method: "POST",
+      headers: { "X-Internal-Secret": LAYBY_REMINDER_INTERNAL_SECRET },
+    });
+    const body = await upstream.text();
+    console.log(`Weekly reminder trigger forwarded: upstream responded ${upstream.status} ${body}`);
+    res.status(upstream.status).type(upstream.headers.get("content-type") || "text/plain").send(body);
+  } catch (err) {
+    console.error("Error forwarding weekly reminder trigger:", err);
+    res.status(502).json({ error: "Could not reach layby agreement backend." });
+  }
+});
 
 app.get("/healthz", (_req, res) => res.status(200).send("ok"));
 
